@@ -158,12 +158,9 @@ fn main() {
                 .help("Clone /dev/fuse fd for each thread (Linux only)"),
         )
         .get_matches();
-
     env_logger::init();
 
     let mountpoint = matches.get_one::<String>("MOUNT_POINT").unwrap();
-
-    // Determine number of threads
     let max_threads: usize = if matches.get_flag("single-threaded") {
         1
     } else {
@@ -173,9 +170,7 @@ fn main() {
             .parse()
             .expect("Invalid number of threads")
     };
-
     let clone_fd = matches.get_flag("clone-fd");
-
     let mut options = vec![MountOption::RO, MountOption::FSName("hello_mt".to_string())];
     if matches.get_flag("auto_unmount") {
         options.push(MountOption::AutoUnmount);
@@ -183,7 +178,6 @@ fn main() {
     if matches.get_flag("allow-root") {
         options.push(MountOption::AllowRoot);
     }
-
     let mode = if max_threads == 1 {
         "single-threaded"
     } else {
@@ -195,22 +189,14 @@ fn main() {
     log::info!("Mode: {}", mode);
     log::info!("Max threads: {}", max_threads);
     log::info!("Clone FD: {}", clone_fd);
-    log::info!("");
 
-    // Create a regular session
     let session = Session::new(HelloFS, mountpoint, &options)
         .expect("Failed to create session");
-
-    // Configure multi-threading
     let config = SessionConfig::new()
         .max_threads(max_threads)
         .clone_fd(clone_fd);
-
-    // Convert to multi-threaded session
     let mut mt_session = MtSession::from_session(session, config)
         .expect("Failed to create multi-threaded session");
 
-    // Run the session loop
-    log::info!("Starting {} session loop", mode);
     mt_session.run().expect("Session failed");
 }

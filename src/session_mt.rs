@@ -34,10 +34,9 @@ pub struct SessionConfig {
     /// Maximum number of worker threads
     pub max_threads: usize,
     /// Maximum number of idle threads before they are destroyed
-    /// Set to -1 to disable thread destruction (recommended for performance)
+    /// Set to -1 to disable thread destruction
     pub max_idle_threads: i32,
     /// Whether to clone the /dev/fuse file descriptor for each thread
-    /// This may improve performance by allowing parallel kernel operations
     pub clone_fd: bool,
 }
 
@@ -116,11 +115,11 @@ impl Worker {
 
 /// Shared state for the multi-threaded session
 struct MtState {
-    /// Number of worker threads (atomic for lock-free access)
+    /// Number of worker threads
     num_workers: AtomicUsize,
-    /// Number of available (idle) worker threads (atomic for lock-free access)
+    /// Number of available worker threads
     num_available: AtomicUsize,
-    /// Whether the session should exit (atomic for lock-free access)
+    /// Whether the session should exit
     exit: AtomicBool,
     /// Protected state for thread management
     inner: Mutex<MtStateInner>,
@@ -150,11 +149,6 @@ impl MtState {
     }
 }
 
-/// Wrapper around UnsafeCell that implements Sync when T is Sync
-///
-/// SAFETY: This type allows concurrent access to the inner value.
-/// It is only safe to use when T implements Sync, meaning T can be
-/// safely accessed from multiple threads simultaneously.
 struct SyncUnsafeCell<T>(UnsafeCell<T>);
 
 impl<T> SyncUnsafeCell<T> {
@@ -166,21 +160,13 @@ impl<T> SyncUnsafeCell<T> {
         self.0.get()
     }
 }
-
-// SAFETY: SyncUnsafeCell<T> is Sync when T is Sync
-// This allows Arc<SyncUnsafeCell<T>> to be Send across threads
 unsafe impl<T: Sync> Sync for SyncUnsafeCell<T> {}
 
+
 /// Multi-threaded session runner
-///
-/// SAFETY: This structure uses `SyncUnsafeCell` to allow concurrent access to the filesystem.
-/// The filesystem MUST be thread-safe (Sync). The caller is responsible for ensuring
-/// that the filesystem implementation can handle concurrent calls safely.
 pub struct MtSession<FS: Filesystem> {
     state: Arc<MtState>,
     config: SessionConfig,
-    /// SAFETY: SyncUnsafeCell allows interior mutability. Multiple threads will access this
-    /// concurrently. The FS type must implement Sync to ensure thread-safety.
     filesystem: Arc<SyncUnsafeCell<FS>>,
     channel: Channel,
     mount: Arc<Mutex<Option<(PathBuf, Mount)>>>,
@@ -193,7 +179,6 @@ pub struct MtSession<FS: Filesystem> {
     worker_counter: Arc<AtomicUsize>,
 }
 
-// SAFETY: MtSession is Send + Sync when FS is Send + Sync
 unsafe impl<FS: Filesystem + Send + Sync> Send for MtSession<FS> {}
 unsafe impl<FS: Filesystem + Send + Sync> Sync for MtSession<FS> {}
 
@@ -244,23 +229,18 @@ impl<FS: Filesystem + Send + Sync + 'static> MtSession<FS> {
     pub fn from_session(session: Session<FS>, config: SessionConfig) -> io::Result<Self> {
         config.validate()?;
 
-        // Use ManuallyDrop to prevent Session's Drop from running
         let manual_session = std::mem::ManuallyDrop::new(session);
 
-        // Clone the channel (this is safe since Channel is Clone)
         let channel = manual_session.ch.clone();
 
-        // Clone the mount Arc to keep the mount alive
         let mount = manual_session.mount.clone();
 
-        // Extract values we need
         let session_owner = manual_session.session_owner;
         let proto_major = manual_session.proto_major;
         let proto_minor = manual_session.proto_minor;
         let allowed = manual_session.allowed;
         let initialized = manual_session.initialized;
 
-        // Safely extract the filesystem using ptr::read
         let filesystem = unsafe {
             std::ptr::read(&manual_session.filesystem as *const FS)
         };
@@ -293,11 +273,8 @@ impl<FS: Filesystem + Send + Sync + 'static> MtSession<FS> {
             mode, self.config.max_threads
         );
 
-        // Start with exactly ONE worker thread, like libfuse does
-        // Additional threads will be created on-demand when all workers are busy
         self.start_worker()?;
 
-        // Wait for workers to finish
         let mut inner = self.state.inner.lock().unwrap();
         while self.state.num_workers.load(Ordering::Acquire) > 0 {
             if self.state.exit.load(Ordering::Acquire) && inner.workers.is_empty() {
@@ -306,7 +283,6 @@ impl<FS: Filesystem + Send + Sync + 'static> MtSession<FS> {
             inner = self.state.cvar.wait(inner).unwrap();
         }
 
-        // Collect any error
         let result = if let Some(err) = inner.error.take() {
             Err(err)
         } else {
@@ -321,7 +297,6 @@ impl<FS: Filesystem + Send + Sync + 'static> MtSession<FS> {
     fn start_worker(&self) -> io::Result<()> {
         let worker_id = self.worker_counter.fetch_add(1, Ordering::Relaxed);
 
-        // Increment total count BEFORE spawning to reserve the slot
         self.state.num_workers.fetch_add(1, Ordering::SeqCst);
 
         let state = self.state.clone();
@@ -378,7 +353,6 @@ impl<FS: Filesystem + Send + Sync + 'static> MtSession<FS> {
                 Ok(())
             }
             Err(e) => {
-                // Rollback count on failure
                 self.state.num_workers.fetch_sub(1, Ordering::SeqCst);
                 Err(e)
             }
@@ -403,26 +377,19 @@ fn worker_main<FS: Filesystem + Send + Sync + 'static>(
     worker_counter: Arc<AtomicUsize>,
     master_channel: Channel,
 ) {
-    // Each worker has its own buffer to avoid contention
     let mut buffer = vec![0u8; BUFFER_SIZE];
-    let mut self_cleaned = false;  // Track if we already cleaned up
+    let mut self_cleaned = false;
 
-    // Helper closure to spawn a new thread
     let try_spawn_new_worker = |current_total: usize| {
-        // Double check against max threads
         if current_total >= config.max_threads {
             return;
         }
 
-        // Generate new ID
-        let new_id = worker_counter.fetch_add(1, Ordering::Relaxed);
-
-        // Reserve slot
+       let new_id = worker_counter.fetch_add(1, Ordering::Relaxed);
         state.num_workers.fetch_add(1, Ordering::SeqCst);
 
         debug!("Worker {} spawning helper {}", worker_id, new_id);
 
-        // Prepare clones
         let state_c = state.clone();
         let config_c = config.clone();
         let fs_c = filesystem.clone();
@@ -434,7 +401,6 @@ fn worker_main<FS: Filesystem + Send + Sync + 'static>(
         let wc_c = worker_counter.clone();
         let mc_c = master_channel.clone();
 
-        // Clone channel logic
         let ch_c = if config.clone_fd {
             match master_channel.clone_fd() {
                 Ok(ch) => ch,
@@ -460,23 +426,16 @@ fn worker_main<FS: Filesystem + Send + Sync + 'static>(
     };
 
     loop {
-        // Fast exit check
         if state.exit.load(Ordering::Relaxed) {
             debug!("Worker {} exiting (session exit)", worker_id);
             break;
         }
 
-        // Announce availability
-        // We are about to block on receive, so we are "idle"
         state.num_available.fetch_add(1, Ordering::Release);
 
         let buf = aligned_sub_buf(&mut buffer, std::mem::align_of::<crate::ll::fuse_abi::fuse_in_header>());
-
-        // Block waiting for request
         let res = channel.receive(buf);
 
-        // We woke up, we are busy now
-        // Acquire ensures we see updates from other threads
         let prev_idle = state.num_available.fetch_sub(1, Ordering::Acquire);
 
         let size = match res {
@@ -503,11 +462,8 @@ fn worker_main<FS: Filesystem + Send + Sync + 'static>(
             }
         };
 
-        // Decision: Do we need more threads?
-        // If prev_idle was 1, it is now 0 (we were the last one).
-        // If prev_idle was <= 1, it means the pool is exhausted.
+        // The pool is exhausted
         if prev_idle <= 1 {
-            // Check opcode for FORGET (optimization)
             let is_forget = if size >= std::mem::size_of::<crate::ll::fuse_abi::fuse_in_header>() {
                 let header = unsafe { &*(buf.as_ptr() as *const crate::ll::fuse_abi::fuse_in_header) };
                 header.opcode == FUSE_FORGET as u32 || header.opcode == FUSE_BATCH_FORGET as u32
@@ -518,7 +474,6 @@ fn worker_main<FS: Filesystem + Send + Sync + 'static>(
             if !is_forget && initialized.load(Ordering::Relaxed) {
                 let current_workers = state.num_workers.load(Ordering::Relaxed);
                 if current_workers < config.max_threads {
-                    // Spawn logic - involves locking
                     try_spawn_new_worker(current_workers);
                 }
             }
@@ -526,17 +481,13 @@ fn worker_main<FS: Filesystem + Send + Sync + 'static>(
 
         // Process the Request
         if let Some(req) = Request::new(channel.sender(), &buf[..size]) {
-            // SAFE: FS implements Sync, so multiple &mut FS from different threads are safe
-            // because FS uses interior mutability (Mutex/RwLock) to protect its state.
             let fs_ref = unsafe { &mut *filesystem.get() };
 
-            // Get the current state
             let mut proto_major_value = proto_major.load(Ordering::Relaxed);
             let mut proto_minor_value = proto_minor.load(Ordering::Relaxed);
             let mut initialized_value = initialized.load(Ordering::Relaxed);
             let destroyed_value = destroyed.load(Ordering::Relaxed);
 
-            // Dispatch the request with explicit context
             req.dispatch_with_context(
                 fs_ref,
                 &allowed,
@@ -547,7 +498,6 @@ fn worker_main<FS: Filesystem + Send + Sync + 'static>(
                 destroyed_value,
             );
 
-            // Update the shared state if it was modified during dispatch
             proto_major.store(proto_major_value, Ordering::Relaxed);
             proto_minor.store(proto_minor_value, Ordering::Relaxed);
             if initialized_value != initialized.load(Ordering::Relaxed) {
@@ -555,25 +505,22 @@ fn worker_main<FS: Filesystem + Send + Sync + 'static>(
             }
         }
 
-        // Idle thread cleanup logic (Optional / Debounced)
+        // Idle thread cleanup logic
         if config.max_idle_threads != -1 {
             let current_idle = state.num_available.load(Ordering::Relaxed);
             if current_idle > config.max_idle_threads as usize {
-                // We have too many idle threads
                 let mut inner = state.inner.lock().unwrap();
 
-                // Re-check inside lock to avoid race
                 let recheck_idle = state.num_available.load(Ordering::Relaxed);
                 let recheck_workers = state.num_workers.load(Ordering::Relaxed);
 
                 if recheck_idle > config.max_idle_threads as usize && recheck_workers > 1 {
-                     // Remove ourselves from the list
                      if let Some(pos) = inner.workers.iter().position(|w| w.id == worker_id) {
                          inner.workers.remove(pos);
                      }
                      state.num_workers.fetch_sub(1, Ordering::SeqCst);
                      state.num_available.fetch_sub(1, Ordering::SeqCst);
-                     self_cleaned = true;  // Mark that we've cleaned up
+                     self_cleaned = true;
                      debug!("Worker {} exiting (idle threads: {} > max: {})",
                             worker_id, recheck_idle, config.max_idle_threads);
                      break;
@@ -581,19 +528,14 @@ fn worker_main<FS: Filesystem + Send + Sync + 'static>(
             }
         }
     }
-
-    // Worker is exiting - clean up (if not already done in idle cleanup)
     if !self_cleaned {
         let mut inner = state.inner.lock().unwrap();
-        // Remove ourselves from the workers list
         if let Some(pos) = inner.workers.iter().position(|w| w.id == worker_id) {
             inner.workers.remove(pos);
         }
-        // Decrease worker count
         state.num_workers.fetch_sub(1, Ordering::SeqCst);
     }
 
-    // Thread exit notification
     state.cvar.notify_all();
 }
 
@@ -601,13 +543,10 @@ impl<FS: Filesystem> Drop for MtSession<FS> {
     fn drop(&mut self) {
         self.exit();
 
-        // Collect workers to join
         let workers = {
             let mut inner = self.state.inner.lock().unwrap();
             std::mem::take(&mut inner.workers)
         };
-
-        // Join all workers outside the lock
         for worker in workers {
             if let Some(thread) = worker.thread {
                 let _ = thread.join();
