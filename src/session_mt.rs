@@ -34,7 +34,6 @@ pub struct SessionConfig {
     /// Maximum number of worker threads
     pub max_threads: usize,
     /// Maximum number of idle threads before they are destroyed
-    /// Set to -1 to disable thread destruction
     pub max_idle_threads: i32,
     /// Whether to clone the /dev/fuse file descriptor for each thread
     pub clone_fd: bool,
@@ -232,9 +231,7 @@ impl<FS: Filesystem + Send + Sync + 'static> MtSession<FS> {
         let manual_session = std::mem::ManuallyDrop::new(session);
 
         let channel = manual_session.ch.clone();
-
         let mount = manual_session.mount.clone();
-
         let session_owner = manual_session.session_owner;
         let proto_major = manual_session.proto_major;
         let proto_minor = manual_session.proto_minor;
@@ -297,7 +294,7 @@ impl<FS: Filesystem + Send + Sync + 'static> MtSession<FS> {
     fn start_worker(&self) -> io::Result<()> {
         let worker_id = self.worker_counter.fetch_add(1, Ordering::Relaxed);
 
-        self.state.num_workers.fetch_add(1, Ordering::SeqCst);
+        self.state.num_workers.fetch_add(1, Ordering::AcqRel);
 
         let state = self.state.clone();
         let config = self.config.clone();
@@ -318,7 +315,7 @@ impl<FS: Filesystem + Send + Sync + 'static> MtSession<FS> {
 
         let proto_major = self.proto_major.clone();
         let proto_minor = self.proto_minor.clone();
-        let allowed = self.allowed.clone();
+        let allowed = self.allowed;
         let initialized = self.initialized.clone();
         let destroyed = self.destroyed.clone();
         let session_owner = self.session_owner;
@@ -353,7 +350,7 @@ impl<FS: Filesystem + Send + Sync + 'static> MtSession<FS> {
                 Ok(())
             }
             Err(e) => {
-                self.state.num_workers.fetch_sub(1, Ordering::SeqCst);
+                self.state.num_workers.fetch_sub(1, Ordering::AcqRel);
                 Err(e)
             }
         }
@@ -385,8 +382,8 @@ fn worker_main<FS: Filesystem + Send + Sync + 'static>(
             return;
         }
 
-       let new_id = worker_counter.fetch_add(1, Ordering::Relaxed);
-        state.num_workers.fetch_add(1, Ordering::SeqCst);
+        let new_id = worker_counter.fetch_add(1, Ordering::Relaxed);
+        state.num_workers.fetch_add(1, Ordering::AcqRel);
 
         debug!("Worker {} spawning helper {}", worker_id, new_id);
 
@@ -395,7 +392,7 @@ fn worker_main<FS: Filesystem + Send + Sync + 'static>(
         let fs_c = filesystem.clone();
         let pm_c = proto_major.clone();
         let pmi_c = proto_minor.clone();
-        let al_c = allowed.clone();
+        let al_c = allowed;
         let init_c = initialized.clone();
         let dest_c = destroyed.clone();
         let wc_c = worker_counter.clone();
@@ -420,7 +417,7 @@ fn worker_main<FS: Filesystem + Send + Sync + 'static>(
             },
             Err(e) => {
                 error!("Failed to spawn helper: {}", e);
-                state.num_workers.fetch_sub(1, Ordering::SeqCst);
+                state.num_workers.fetch_sub(1, Ordering::AcqRel);
             }
         }
     };
@@ -518,8 +515,8 @@ fn worker_main<FS: Filesystem + Send + Sync + 'static>(
                      if let Some(pos) = inner.workers.iter().position(|w| w.id == worker_id) {
                          inner.workers.remove(pos);
                      }
-                     state.num_workers.fetch_sub(1, Ordering::SeqCst);
-                     state.num_available.fetch_sub(1, Ordering::SeqCst);
+                     state.num_workers.fetch_sub(1, Ordering::AcqRel);
+                     state.num_available.fetch_sub(1, Ordering::AcqRel);
                      self_cleaned = true;
                      debug!("Worker {} exiting (idle threads: {} > max: {})",
                             worker_id, recheck_idle, config.max_idle_threads);
@@ -533,7 +530,7 @@ fn worker_main<FS: Filesystem + Send + Sync + 'static>(
         if let Some(pos) = inner.workers.iter().position(|w| w.id == worker_id) {
             inner.workers.remove(pos);
         }
-        state.num_workers.fetch_sub(1, Ordering::SeqCst);
+        state.num_workers.fetch_sub(1, Ordering::AcqRel);
     }
 
     state.cvar.notify_all();
