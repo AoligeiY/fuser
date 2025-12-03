@@ -161,6 +161,31 @@ impl<T> SyncUnsafeCell<T> {
 }
 unsafe impl<T: Sync> Sync for SyncUnsafeCell<T> {}
 
+/// Context shared between all worker threads
+struct SessionContext {
+    /// Protocol major version
+    proto_major: AtomicU32,
+    /// Protocol minor version
+    proto_minor: AtomicU32,
+    /// Whether the session is initialized
+    initialized: AtomicBool,
+    /// Whether the session is destroyed
+    destroyed: AtomicBool,
+    /// Session owner ID
+    session_owner: u32,
+}
+
+impl SessionContext {
+    fn new(proto_major: u32, proto_minor: u32, initialized: bool, session_owner: u32) -> Self {
+        Self {
+            proto_major: AtomicU32::new(proto_major),
+            proto_minor: AtomicU32::new(proto_minor),
+            initialized: AtomicBool::new(initialized),
+            destroyed: AtomicBool::new(false),
+            session_owner,
+        }
+    }
+}
 
 /// Multi-threaded session runner
 pub struct MtSession<FS: Filesystem> {
@@ -169,12 +194,8 @@ pub struct MtSession<FS: Filesystem> {
     filesystem: Arc<SyncUnsafeCell<FS>>,
     channel: Channel,
     mount: Arc<Mutex<Option<(PathBuf, Mount)>>>,
-    session_owner: u32,
-    proto_major: Arc<AtomicU32>,
-    proto_minor: Arc<AtomicU32>,
+    context: Arc<SessionContext>,
     allowed: SessionACL,
-    initialized: Arc<AtomicBool>,
-    destroyed: Arc<AtomicBool>,
     worker_counter: Arc<AtomicUsize>,
 }
 
@@ -186,12 +207,8 @@ impl<FS: Filesystem> std::fmt::Debug for MtSession<FS> {
         f.debug_struct("MtSession")
             .field("config", &self.config)
             .field("mount", &self.mount)
-            .field("session_owner", &self.session_owner)
-            .field("proto_major", &self.proto_major)
-            .field("proto_minor", &self.proto_minor)
+            .field("session_owner", &self.context.session_owner)
             .field("allowed", &self.allowed)
-            .field("initialized", &self.initialized)
-            .field("destroyed", &self.destroyed)
             .finish()
     }
 }
@@ -237,7 +254,7 @@ impl<FS: Filesystem + Send + Sync + 'static> MtSession<FS> {
         let proto_minor = manual_session.proto_minor;
         let allowed = manual_session.allowed;
         let initialized = manual_session.initialized;
-
+        
         let filesystem = unsafe {
             std::ptr::read(&manual_session.filesystem as *const FS)
         };
@@ -248,12 +265,8 @@ impl<FS: Filesystem + Send + Sync + 'static> MtSession<FS> {
             filesystem: Arc::new(SyncUnsafeCell::new(filesystem)),
             channel,
             mount,
-            session_owner,
-            proto_major: Arc::new(AtomicU32::new(proto_major)),
-            proto_minor: Arc::new(AtomicU32::new(proto_minor)),
+            context: Arc::new(SessionContext::new(proto_major, proto_minor, initialized, session_owner)),
             allowed,
-            initialized: Arc::new(AtomicBool::new(initialized)),
-            destroyed: Arc::new(AtomicBool::new(false)),
             worker_counter: Arc::new(AtomicUsize::new(0)),
         })
     }
@@ -294,11 +307,16 @@ impl<FS: Filesystem + Send + Sync + 'static> MtSession<FS> {
     fn start_worker(&self) -> io::Result<()> {
         let worker_id = self.worker_counter.fetch_add(1, Ordering::Relaxed);
 
-        self.state.num_workers.fetch_add(1, Ordering::AcqRel);
+        let prev_workers = self.state.num_workers.fetch_add(1, Ordering::AcqRel);
+        if prev_workers >= self.config.max_threads {
+             self.state.num_workers.fetch_sub(1, Ordering::AcqRel);
+             return Err(io::Error::new(io::ErrorKind::ResourceBusy, "Max threads reached"));
+        }
 
         let state = self.state.clone();
         let config = self.config.clone();
         let filesystem = self.filesystem.clone();
+        let context = self.context.clone();
 
         // Clone the channel if clone_fd is enabled, otherwise share the same channel
         let channel = if self.config.clone_fd {
@@ -313,12 +331,7 @@ impl<FS: Filesystem + Send + Sync + 'static> MtSession<FS> {
             self.channel.clone()
         };
 
-        let proto_major = self.proto_major.clone();
-        let proto_minor = self.proto_minor.clone();
         let allowed = self.allowed;
-        let initialized = self.initialized.clone();
-        let destroyed = self.destroyed.clone();
-        let session_owner = self.session_owner;
         let worker_counter = self.worker_counter.clone();
         let master_channel = self.channel.clone();
 
@@ -331,12 +344,8 @@ impl<FS: Filesystem + Send + Sync + 'static> MtSession<FS> {
                     config,
                     filesystem,
                     channel,
-                    session_owner,
-                    proto_major,
-                    proto_minor,
+                    context,
                     allowed,
-                    initialized,
-                    destroyed,
                     worker_counter,
                     master_channel,
                 )
@@ -359,18 +368,15 @@ impl<FS: Filesystem + Send + Sync + 'static> MtSession<FS> {
 
 /// Main function for worker threads
 #[allow(unused_variables)]
+#[allow(clippy::too_many_arguments)]
 fn worker_main<FS: Filesystem + Send + Sync + 'static>(
     worker_id: usize,
     state: Arc<MtState>,
     config: SessionConfig,
     filesystem: Arc<SyncUnsafeCell<FS>>,
     channel: Channel,
-    session_owner: u32,
-    proto_major: Arc<AtomicU32>,
-    proto_minor: Arc<AtomicU32>,
+    context: Arc<SessionContext>,
     allowed: SessionACL,
-    initialized: Arc<AtomicBool>,
-    destroyed: Arc<AtomicBool>,
     worker_counter: Arc<AtomicUsize>,
     master_channel: Channel,
 ) {
@@ -378,23 +384,21 @@ fn worker_main<FS: Filesystem + Send + Sync + 'static>(
     let mut self_cleaned = false;
 
     let try_spawn_new_worker = |current_total: usize| {
-        if current_total >= config.max_threads {
+        // Strict limit check with fetch_add
+        let prev = state.num_workers.fetch_add(1, Ordering::AcqRel);
+        if prev >= config.max_threads {
+            state.num_workers.fetch_sub(1, Ordering::AcqRel);
             return;
         }
 
         let new_id = worker_counter.fetch_add(1, Ordering::Relaxed);
-        state.num_workers.fetch_add(1, Ordering::AcqRel);
-
-        debug!("Worker {} spawning helper {}", worker_id, new_id);
+        debug!("Worker {} spawning new worker thread {}", worker_id, new_id);
 
         let state_c = state.clone();
         let config_c = config.clone();
         let fs_c = filesystem.clone();
-        let pm_c = proto_major.clone();
-        let pmi_c = proto_minor.clone();
+        let ctx_c = context.clone();
         let al_c = allowed;
-        let init_c = initialized.clone();
-        let dest_c = destroyed.clone();
         let wc_c = worker_counter.clone();
         let mc_c = master_channel.clone();
 
@@ -409,14 +413,14 @@ fn worker_main<FS: Filesystem + Send + Sync + 'static>(
 
         let builder = thread::Builder::new().name(format!("fuse-worker-{}", new_id));
         match builder.spawn(move || {
-            worker_main(new_id, state_c, config_c, fs_c, ch_c, session_owner, pm_c, pmi_c, al_c, init_c, dest_c, wc_c, mc_c)
+            worker_main(new_id, state_c, config_c, fs_c, ch_c, ctx_c, al_c, wc_c, mc_c)
         }) {
             Ok(t) => {
                 let mut inner = state.inner.lock().unwrap();
                 inner.workers.push(Worker::new(new_id, t));
             },
             Err(e) => {
-                error!("Failed to spawn helper: {}", e);
+                error!("Failed to spawn worker: {}", e);
                 state.num_workers.fetch_sub(1, Ordering::AcqRel);
             }
         }
@@ -468,7 +472,7 @@ fn worker_main<FS: Filesystem + Send + Sync + 'static>(
                 false
             };
 
-            if !is_forget && initialized.load(Ordering::Relaxed) {
+            if !is_forget && context.initialized.load(Ordering::Relaxed) {
                 let current_workers = state.num_workers.load(Ordering::Relaxed);
                 if current_workers < config.max_threads {
                     try_spawn_new_worker(current_workers);
@@ -480,25 +484,32 @@ fn worker_main<FS: Filesystem + Send + Sync + 'static>(
         if let Some(req) = Request::new(channel.sender(), &buf[..size]) {
             let fs_ref = unsafe { &mut *filesystem.get() };
 
-            let mut proto_major_value = proto_major.load(Ordering::Relaxed);
-            let mut proto_minor_value = proto_minor.load(Ordering::Relaxed);
-            let mut initialized_value = initialized.load(Ordering::Relaxed);
-            let destroyed_value = destroyed.load(Ordering::Relaxed);
+            let mut proto_major_value = context.proto_major.load(Ordering::Relaxed);
+            let mut proto_minor_value = context.proto_minor.load(Ordering::Relaxed);
+            let mut initialized_value = context.initialized.load(Ordering::Relaxed);
+            let destroyed_value = context.destroyed.load(Ordering::Relaxed);
 
             req.dispatch_with_context(
                 fs_ref,
                 &allowed,
-                session_owner,
+                context.session_owner,
                 &mut proto_major_value,
                 &mut proto_minor_value,
                 &mut initialized_value,
                 destroyed_value,
             );
 
-            proto_major.store(proto_major_value, Ordering::Relaxed);
-            proto_minor.store(proto_minor_value, Ordering::Relaxed);
-            if initialized_value != initialized.load(Ordering::Relaxed) {
-                initialized.store(initialized_value, Ordering::SeqCst);
+            let old_major = context.proto_major.load(Ordering::Relaxed);
+            if proto_major_value != old_major {
+                context.proto_major.store(proto_major_value, Ordering::Relaxed);
+            }
+            let old_minor = context.proto_minor.load(Ordering::Relaxed);
+            if proto_minor_value != old_minor {
+                context.proto_minor.store(proto_minor_value, Ordering::Relaxed);
+            }
+            let old_init = context.initialized.load(Ordering::Relaxed);
+            if initialized_value != old_init {
+                context.initialized.store(initialized_value, Ordering::SeqCst);
             }
         }
 

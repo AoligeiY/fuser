@@ -68,7 +68,7 @@ impl<'a> Request<'a> {
     }
 
     /// Dispatch request with explicit session context instead of Session struct.
-    /// This is used by multi-threaded session to avoid unsafe copying of FS.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn dispatch_with_context<FS: Filesystem>(
         &self,
         filesystem: &mut FS,
@@ -118,7 +118,8 @@ impl<'a> Request<'a> {
         )
     }
 
-    /// Internal dispatch request that uses explicit parameters instead of Session struct.
+    /// Internal dispatch request
+    #[allow(clippy::too_many_arguments)]
     fn dispatch_req_with_context<FS: Filesystem>(
         &self,
         filesystem: &mut FS,
