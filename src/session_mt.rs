@@ -89,11 +89,6 @@ impl SessionConfig {
         }
         Ok(())
     }
-
-    /// Check if running in single-threaded mode
-    pub fn is_single_threaded(&self) -> bool {
-        self.max_threads == 1
-    }
 }
 
 /// Worker thread state
@@ -273,13 +268,13 @@ impl<FS: Filesystem + Send + Sync + 'static> MtSession<FS> {
 
     /// Run the multi-threaded session loop
     pub fn run(&mut self) -> io::Result<()> {
-        let mode = if self.config.is_single_threaded() {
+        let mode = if self.config.max_threads == 1 {
             "single-threaded"
         } else {
             "multi-threaded"
         };
         info!(
-            "Starting {} FUSE session (max {} threads)",
+            "Initializing {} FUSE session with maximum {} worker threads",
             mode, self.config.max_threads
         );
 
@@ -299,7 +294,7 @@ impl<FS: Filesystem + Send + Sync + 'static> MtSession<FS> {
             Ok(())
         };
 
-        info!("{} FUSE session ended", mode);
+        info!("FUSE session ended");
         result
     }
 
@@ -355,7 +350,7 @@ impl<FS: Filesystem + Send + Sync + 'static> MtSession<FS> {
             Ok(thread) => {
                 let mut inner = self.state.inner.lock().unwrap();
                 inner.workers.push(Worker::new(worker_id, thread));
-                debug!("Worker {} started", worker_id);
+                debug!("Worker thread {} initialized", worker_id);
                 Ok(())
             }
             Err(e) => {

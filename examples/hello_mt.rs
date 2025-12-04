@@ -116,8 +116,6 @@ impl Filesystem for HelloFS {
 fn main() {
     let matches = Command::new("hello_mt")
         .version(crate_version!())
-        .author("Fuser Contributors")
-        .about("Multi-threaded FUSE hello world example")
         .arg(
             Arg::new("MOUNT_POINT")
                 .required(true)
@@ -142,35 +140,22 @@ fn main() {
                 .short('t')
                 .value_name("NUM")
                 .default_value("10")
-                .help("Maximum number of worker threads (1 for single-threaded mode)"),
-        )
-        .arg(
-            Arg::new("single-threaded")
-                .long("single-threaded")
-                .short('s')
-                .action(ArgAction::SetTrue)
-                .help("Run in single-threaded mode (equivalent to --threads=1)"),
+                .help("Maximum number of worker threads"),
         )
         .arg(
             Arg::new("clone-fd")
                 .long("clone-fd")
                 .action(ArgAction::SetTrue)
-                .help("Clone /dev/fuse fd for each thread (Linux only)"),
+                .help("Clone /dev/fuse fd for each thread"),
         )
         .get_matches();
+
     env_logger::init();
 
     let mountpoint = matches.get_one::<String>("MOUNT_POINT").unwrap();
-    let max_threads: usize = if matches.get_flag("single-threaded") {
-        1
-    } else {
-        matches
-            .get_one::<String>("threads")
-            .unwrap()
-            .parse()
-            .expect("Invalid number of threads")
-    };
+    let max_threads: usize = matches.get_one::<String>("threads").unwrap().parse().expect("Invalid number of threads");
     let clone_fd = matches.get_flag("clone-fd");
+
     let mut options = vec![MountOption::RO, MountOption::FSName("hello_mt".to_string())];
     if matches.get_flag("auto_unmount") {
         options.push(MountOption::AutoUnmount);
@@ -178,25 +163,17 @@ fn main() {
     if matches.get_flag("allow-root") {
         options.push(MountOption::AllowRoot);
     }
-    let mode = if max_threads == 1 {
-        "single-threaded"
-    } else {
-        "multi-threaded"
-    };
 
-    log::info!("=== {} FUSE Filesystem ===", mode.to_uppercase());
-    log::info!("Mountpoint: {}", mountpoint);
-    log::info!("Mode: {}", mode);
-    log::info!("Max threads: {}", max_threads);
-    log::info!("Clone FD: {}", clone_fd);
+    log::info!("Initializing FUSE filesystem: mountpoint={}, max_threads={}, clone_fd={}", 
+        mountpoint, max_threads, clone_fd);
 
     let session = Session::new(HelloFS, mountpoint, &options)
-        .expect("Failed to create session");
+        .expect("Failed to create FUSE session");
     let config = SessionConfig::new()
         .max_threads(max_threads)
         .clone_fd(clone_fd);
     let mut mt_session = MtSession::from_session(session, config)
-        .expect("Failed to create multi-threaded session");
+        .expect("Failed to initialize multi-threaded session");
 
-    mt_session.run().expect("Session failed");
+    mt_session.run().expect("FUSE session terminated with error");
 }
