@@ -67,7 +67,7 @@ impl<'a> Request<'a> {
         }
     }
 
-    /// Dispatch request with explicit session context instead of Session struct.
+    /// Dispatch request with Session context
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn dispatch_with_context<FS: Filesystem>(
         &self,
@@ -77,7 +77,7 @@ impl<'a> Request<'a> {
         proto_major: &mut u32,
         proto_minor: &mut u32,
         initialized: &mut bool,
-        destroyed: bool,
+        destroyed: &mut bool,
     ) {
         debug!("{}", self.request);
         let unique = self.request.unique();
@@ -102,7 +102,7 @@ impl<'a> Request<'a> {
         }
     }
 
-    /// Original dispatch_req that uses Session struct for backward compatibility.
+    /// Dispatch request with Session struct
     fn dispatch_req<FS: Filesystem>(
         &self,
         se: &mut Session<FS>,
@@ -114,7 +114,7 @@ impl<'a> Request<'a> {
             &mut se.proto_major,
             &mut se.proto_minor,
             &mut se.initialized,
-            se.destroyed,
+            &mut se.destroyed,
         )
     }
 
@@ -128,7 +128,7 @@ impl<'a> Request<'a> {
         proto_major: &mut u32,
         proto_minor: &mut u32,
         initialized: &mut bool,
-        destroyed: bool,
+        destroyed: &mut bool,
     ) -> Result<Option<Response<'_>>, Errno> {
         let op = self.request.operation().map_err(|_| Errno::ENOSYS)?;
         // Implement allow_root & access check for auto_unmount
@@ -220,11 +220,11 @@ impl<'a> Request<'a> {
             // Filesystem destroyed
             ll::Operation::Destroy(x) => {
                 filesystem.destroy();
-                // Note: destroyed is not a &mut because it's a terminal operation
+                *destroyed = true;
                 return Ok(Some(x.reply()));
             }
             // Any operation is invalid after destroy
-            _ if destroyed => {
+            _ if *destroyed => {
                 warn!("Ignoring FUSE operation after destroy: {}", self.request);
                 return Err(Errno::EIO);
             }

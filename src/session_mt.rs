@@ -182,6 +182,52 @@ impl SessionContext {
     }
 }
 
+/// Helper struct to snapshot and sync session state
+struct SessionState {
+    proto_major: u32,
+    proto_minor: u32,
+    initialized: bool,
+    destroyed: bool,
+    _orig_major: u32,
+    _orig_minor: u32,
+    _orig_init: bool,
+    _orig_dest: bool,
+}
+
+impl SessionState {
+    fn new(context: &SessionContext) -> Self {
+        let major = context.proto_major.load(Ordering::Relaxed);
+        let minor = context.proto_minor.load(Ordering::Relaxed);
+        let init = context.initialized.load(Ordering::Relaxed);
+        let dest = context.destroyed.load(Ordering::Relaxed);
+        Self {
+            proto_major: major,
+            proto_minor: minor,
+            initialized: init,
+            destroyed: dest,
+            _orig_major: major,
+            _orig_minor: minor,
+            _orig_init: init,
+            _orig_dest: dest,
+        }
+    }
+
+    fn commit(self, context: &SessionContext) {
+        if self.proto_major != self._orig_major {
+            context.proto_major.store(self.proto_major, Ordering::Relaxed);
+        }
+        if self.proto_minor != self._orig_minor {
+            context.proto_minor.store(self.proto_minor, Ordering::Relaxed);
+        }
+        if self.initialized != self._orig_init {
+            context.initialized.store(self.initialized, Ordering::SeqCst);
+        }
+        if self.destroyed != self._orig_dest {
+            context.destroyed.store(self.destroyed, Ordering::SeqCst);
+        }
+    }
+}
+
 /// Multi-threaded session runner
 pub struct MtSession<FS: Filesystem> {
     state: Arc<MtState>,
@@ -379,7 +425,6 @@ fn worker_main<FS: Filesystem + Send + Sync + 'static>(
     let mut self_cleaned = false;
 
     let try_spawn_new_worker = |current_total: usize| {
-        // Strict limit check with fetch_add
         let prev = state.num_workers.fetch_add(1, Ordering::AcqRel);
         if prev >= config.max_threads {
             state.num_workers.fetch_sub(1, Ordering::AcqRel);
@@ -458,7 +503,7 @@ fn worker_main<FS: Filesystem + Send + Sync + 'static>(
             }
         };
 
-        // The pool is exhausted
+        // Thread pool exhausted
         if prev_idle <= 1 {
             let is_forget = if size >= std::mem::size_of::<crate::ll::fuse_abi::fuse_in_header>() {
                 let header = unsafe { &*(buf.as_ptr() as *const crate::ll::fuse_abi::fuse_in_header) };
@@ -479,36 +524,22 @@ fn worker_main<FS: Filesystem + Send + Sync + 'static>(
         if let Some(req) = Request::new(channel.sender(), &buf[..size]) {
             let fs_ref = unsafe { &mut *filesystem.get() };
 
-            let mut proto_major_value = context.proto_major.load(Ordering::Relaxed);
-            let mut proto_minor_value = context.proto_minor.load(Ordering::Relaxed);
-            let mut initialized_value = context.initialized.load(Ordering::Relaxed);
-            let destroyed_value = context.destroyed.load(Ordering::Relaxed);
+            let mut state = SessionState::new(&context);
 
             req.dispatch_with_context(
                 fs_ref,
                 &allowed,
                 context.session_owner,
-                &mut proto_major_value,
-                &mut proto_minor_value,
-                &mut initialized_value,
-                destroyed_value,
+                &mut state.proto_major,
+                &mut state.proto_minor,
+                &mut state.initialized,
+                &mut state.destroyed,
             );
 
-            let old_major = context.proto_major.load(Ordering::Relaxed);
-            if proto_major_value != old_major {
-                context.proto_major.store(proto_major_value, Ordering::Relaxed);
-            }
-            let old_minor = context.proto_minor.load(Ordering::Relaxed);
-            if proto_minor_value != old_minor {
-                context.proto_minor.store(proto_minor_value, Ordering::Relaxed);
-            }
-            let old_init = context.initialized.load(Ordering::Relaxed);
-            if initialized_value != old_init {
-                context.initialized.store(initialized_value, Ordering::SeqCst);
-            }
+            state.commit(&context);
         }
 
-        // Idle thread cleanup logic
+        // Terminate excess idle threads
         if config.max_idle_threads != -1 {
             let current_idle = state.num_available.load(Ordering::Relaxed);
             if current_idle > config.max_idle_threads as usize {
